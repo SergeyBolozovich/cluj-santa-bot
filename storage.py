@@ -89,6 +89,38 @@ class Storage:
     def get_event_by_creation_key(self, key):
         return self.connection.execute("SELECT * FROM events WHERE creation_key = ?", (key,)).fetchone()
 
+    def participant_games(self, user_id, offset=0, limit=6):
+        """The specification excludes organizer-only games from My Games."""
+        return self.connection.execute(
+            """SELECT e.*, (SELECT count(*) FROM participants all_p
+                   WHERE all_p.event_id = e.id) AS participant_count
+               FROM events e JOIN participants p ON p.event_id = e.id
+               WHERE p.telegram_user_id = ? ORDER BY e.id DESC LIMIT ? OFFSET ?""",
+            (user_id, limit, offset),
+        ).fetchall()
+
+    def participant_event(self, event_id, user_id):
+        return self.connection.execute(
+            """SELECT e.*, (SELECT count(*) FROM participants all_p
+                   WHERE all_p.event_id = e.id) AS participant_count
+               FROM events e JOIN participants p ON p.event_id = e.id
+               WHERE e.id = ? AND p.telegram_user_id = ?""",
+            (event_id, user_id),
+        ).fetchone()
+
+    def saved_recipient(self, event_id, user_id):
+        """Read only this participant's assignment, and only for a completed draw."""
+        return self.connection.execute(
+            """SELECT a.receiver_user_id, receiver.display_name AS receiver_name
+               FROM assignments a JOIN events e ON e.id = a.event_id
+               JOIN participants giver ON giver.event_id = a.event_id
+                   AND giver.telegram_user_id = a.giver_user_id
+               JOIN participants receiver ON receiver.event_id = a.event_id
+                   AND receiver.telegram_user_id = a.receiver_user_id
+               WHERE a.event_id = ? AND a.giver_user_id = ? AND e.status = ?""",
+            (event_id, user_id, COMPLETED),
+        ).fetchone()
+
     def set_message_id(self, event_id, message_id):
         with self.connection:
             self.connection.execute("UPDATE events SET message_id = ? WHERE id = ?", (message_id, event_id))

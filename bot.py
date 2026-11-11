@@ -56,10 +56,141 @@ async def prompt_draft(message, draft):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         db(context).activate_private(update.effective_user.id)
-        await update.message.reply_text(
-            "🎅 Привет! Личный чат активирован. Вернись в группу и нажми «🎁 Присоединиться».\n"
-            "Активация не гарантирует доставку, если бот будет заблокирован."
+        await show_private_menu(update.message)
+
+
+def private_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Мои игры", callback_data="games:0")],
+        [InlineKeyboardButton("ℹ️ Помощь", callback_data="private_help")],
+    ])
+
+
+async def show_private_menu(message):
+    await message.reply_text(
+        "🎅 Тайный Санта\n\nПривет! Здесь ты можешь посмотреть свои игры и узнать, "
+        "кому нужно подготовить подарок.\n\n"
+        "Для регистрации вернись в группу и нажми «🎁 Присоединиться». "
+        "Перед жеребьёвкой каждому участнику нужен личный /start. Блокировка бота может помешать доставке.",
+        reply_markup=private_menu_keyboard(),
+    )
+
+
+def private_event_text(event):
+    statuses = {OPEN: "🟢 Регистрация открыта", COMPLETED: "🎲 Жеребьёвка завершена", CANCELLED: "⛔ Игра отменена"}
+    return (f"🎅 <b>{escape(event['title'])}</b> · №{event['id']}\n"
+            f"💰 Бюджет: {format_budget(event['budget'])}\n"
+            f"{statuses.get(event['status'], 'Жеребьёвка ещё не завершена')}\n"
+            f"👥 Участников: {event['participant_count']}")
+
+
+async def show_my_games(message, context, user_id, offset=0):
+    page_size = 5
+    events = db(context).participant_games(user_id, offset, page_size + 1)
+    rows = []
+    if not events:
+        text = "🎁 Мои игры\n\nНа этой странице игр нет." if offset else (
+            "🎁 Мои игры\n\nТы пока не участвуешь в играх. Нажми «🎁 Присоединиться» в группе. "
+            "Если ты только организатор, управление игрой доступно через кнопку в группе."
         )
+    else:
+        text = "🎁 <b>Мои игры</b>\n\n" + "\n\n".join(private_event_text(e) for e in events[:page_size])
+        rows.extend([
+            [InlineKeyboardButton(f"{offset + i + 1}. {event['title'][:60]} · №{event['id']}", callback_data=f"game:{event['id']}")]
+            for i, event in enumerate(events[:page_size])
+        ])
+    navigation = []
+    if offset:
+        navigation.append(InlineKeyboardButton("← Назад", callback_data=f"games:{max(0, offset - page_size)}"))
+    if len(events) > page_size:
+        navigation.append(InlineKeyboardButton("Далее →", callback_data=f"games:{offset + page_size}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton("Главное меню", callback_data="private_menu")])
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Открой /mygames в личном чате с ботом.")
+        return
+    await show_my_games(update.message, context, update.effective_user.id)
+
+
+async def show_help(message, private):
+    text = (
+        "ℹ️ Помощь\n\n"
+        "В группе: /new или /new название — создать игру с бюджетом в RON; "
+        "/cancel — отменить незавершённое создание. Отвечай на вопросы ответом на сообщение бота.\n"
+        "«Присоединиться» регистрирует в конкретной игре без возможности выхода. "
+        "Каждый участник должен нажать /start в личном чате. Организатор участвует только после отдельной регистрации.\n"
+        "Организатор подтверждает жеребьёвку минимум для 2 участников. "
+        "Отмена открытой игры и повтор неудачных уведомлений доступны через «Управление» в группе.\n\n"
+        "В личном чате: /start — главное меню, /mygames — «Мои игры», /help — помощь. "
+        "После жеребьёвки: «Мои игры» → игра → «Кому я дарю?». Видно только твоё сохранённое назначение. "
+        "В список входят только игры, где ты зарегистрирован участником.\n"
+        "Доставка Telegram не гарантируется; после сбоя возможно повторное сообщение с тем же назначением."
+    )
+    await message.reply_text(text, reply_markup=private_menu_keyboard() if private else None)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == ChatType.PRIVATE or is_group(update):
+        await show_help(update.message, update.effective_chat.type == ChatType.PRIVATE)
+
+
+async def private_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await query.answer("Открой меню в личном чате с ботом.", show_alert=True)
+        return
+    if query.data == "private_menu":
+        await query.answer()
+        await show_private_menu(query.message)
+        return
+    if query.data == "private_help":
+        await query.answer()
+        await show_help(query.message, True)
+        return
+    action, _, raw_id = query.data.partition(":")
+    if action not in {"games", "game", "recipient"} or not raw_id.isascii() or not raw_id.isdecimal() or len(raw_id) > 18:
+        await query.answer("Кнопка недоступна. Открой /mygames заново.", show_alert=True)
+        return
+    number = int(raw_id)
+    user_id = query.from_user.id
+    if action == "games":
+        await query.answer()
+        await show_my_games(query.message, context, user_id, number)
+        return
+    # Never trust membership, status, or a giver ID embedded in an old button.
+    event = db(context).participant_event(number, user_id)
+    if not event:
+        await query.answer("Игра недоступна или ты не зарегистрирован участником.", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton("🎁 Мои игры", callback_data="games:0")]]
+    if action == "recipient":
+        if event["status"] != COMPLETED:
+            await query.answer("Назначение доступно только после завершённой жеребьёвки.", show_alert=True)
+            return
+        recipient = db(context).saved_recipient(number, user_id)
+        await query.answer()
+        if recipient:
+            text = (private_event_text(event) + "\n\n🎁 Ты даришь подарок: "
+                    f"<b>{escape(recipient['receiver_name'])}</b> "
+                    f"<a href='tg://user?id={recipient['receiver_user_id']}'>профиль</a>\n\n🤫 Не раскрывай тайну!")
+        else:
+            text = (private_event_text(event) + "\n\nСохранённое назначение не найдено. "
+                    "Обратись к организатору. Новая жеребьёвка не выполнялась; прежнее личное сообщение может содержать результат.")
+    else:
+        await query.answer()
+        text = private_event_text(event)
+        if event["status"] == COMPLETED:
+            rows.insert(0, [InlineKeyboardButton("🎁 Кому я дарю?", callback_data=f"recipient:{number}")])
+        elif event["status"] == CANCELLED:
+            text += "\n\nИгра отменена. Назначений нет."
+        else:
+            text += "\n\nЖеребьёвка ещё не завершена. Получатель пока недоступен."
+    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows), disable_web_page_preview=True)
 
 
 async def new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,6 +470,9 @@ async def send_saved_notifications(context, event):
                 f"<a href='tg://user?id={assignment['receiver_user_id']}'>профиль</a>\n\n"
                 f"💰 Бюджет: {format_budget(event['budget'])}\n\n🤫 Не раскрывай тайну!",
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎁 Кому я дарю?", callback_data=f"recipient:{event['id']}")],
+                ]),
             )
         except TelegramError:
             # Never store or log raw Telegram errors: they may contain URLs/secrets.
@@ -485,6 +619,8 @@ def main():
     app = Application.builder().token(token).concurrent_updates(False).post_shutdown(shutdown).build()
     app.bot_data["storage"] = storage
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("mygames", my_games))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("new", new_event))
     app.add_handler(CommandHandler("cancel", cancel_creation))
     app.add_handler(CallbackQueryHandler(creation_callback, pattern=r"^(create|discard):[a-f0-9]{32}$"))
@@ -493,6 +629,7 @@ def main():
     app.add_handler(CallbackQueryHandler(draw_callback, pattern=r"^draw:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(draw_callback, pattern=r"^draw_(yes|no):[0-9]+:[a-f0-9]{32}$"))
     app.add_handler(CallbackQueryHandler(retry_callback, pattern=r"^retry:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(private_callback, pattern=r"^(?:private_menu|private_help|(?:games|game|recipient):.*)$"))
     app.add_handler(CallbackQueryHandler(legacy_callback, pattern=r"^(join|draw|noop)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, creation_input))
     app.add_error_handler(on_error)
