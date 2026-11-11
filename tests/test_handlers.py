@@ -28,7 +28,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.context = SimpleNamespace(
             args=[], bot_data={"storage": self.store},
             bot=SimpleNamespace(username="TestSantaBot", edit_message_text=AsyncMock(), send_message=AsyncMock(),
-                                get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member"))),
+                                get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+                                get_chat=AsyncMock(return_value=SimpleNamespace(id=-100, type="group", username=None, invite_link=None))),
         )
         self.context.bot.send_message.return_value = self.message(700)
 

@@ -1,10 +1,12 @@
 import os
 import asyncio
 import sqlite3
+import re
 from html import escape
 from pathlib import Path
 from uuid import uuid4
 from time import monotonic
+from urllib.parse import urlsplit
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ParseMode
@@ -21,6 +23,7 @@ from messages import (
     GROUP_INTRO, REGISTRATION_SUCCESS, REGISTRATION_REPEAT, REGISTRATION_NOTICE,
     DRAW_COMPLETED, MAIN_MENU, WAITING, CANCELLED_GAME, CLOSED, TOO_FEW, assignment_text,
     SETUP_INVITE, SETUP_TITLE, SETUP_BUDGET, SETUP_SUCCESS,
+    ACTIVATION_COPY, REGISTRATION_WARNING,
 )
 
 
@@ -409,9 +412,9 @@ def render_event_text(event, participants, username, announcement=True):
     status = {OPEN: "🟢 Регистрация открыта", CANCELLED: CANCELLED_GAME, COMPLETED: "Статус: жеребьёвка проведена"}[event["status"]]
     text = ((GROUP_INTRO + "\n\n" if announcement else "") + f"🎅 <b>{escape(event['title'])}</b>\n🎁 Бюджет: {format_budget(event['budget'])}\n"
             f"👥 Участников: {len(participants)}\n📩 Связь с ботом: {sum(active)}/{len(participants)}\n{status}\n\n"
-            f"Для личных результатов: <a href='{escape(activation_url(username, event['id']))}'>📩 Открыть бота</a> "
-            "→ Start («Запустить») в Telegram. Если уже активировано, повторять не нужно.\n"
-            "Регистрация необратима.\n\n")
+            f"{ACTIVATION_COPY}\n\n"
+            f"<a href='{escape(activation_url(username, event['id']))}'>📩 Открыть бота</a>\n\n"
+            f"{REGISTRATION_WARNING}\n\n")
     if event["status"] == COMPLETED:
         text += DRAW_COMPLETED + "\n\n"
     text += "✅ — личный чат активирован\n⏳ — ожидает активации\n\n<b>Участники:</b>\n"
@@ -445,6 +448,44 @@ async def refresh_event(context, event):
     return True
 
 
+def group_return_url(chat, message_id):
+    """Use only Telegram chat metadata; basic private groups have no /c/ message links."""
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return None
+    username = getattr(chat, "username", None)
+    if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,32}", username):
+        username = None
+    valid_message = type(message_id) is int and message_id > 0
+    if username:
+        base = f"https://t.me/{username}"
+        return f"{base}/{message_id}" if valid_message else base
+    chat_id = str(chat.id)
+    if chat.type == ChatType.SUPERGROUP and re.fullmatch(r"-100[1-9][0-9]*", chat_id) and valid_message:
+        return f"https://t.me/c/{chat_id[4:]}/{message_id}"
+    invite = getattr(chat, "invite_link", None)
+    if isinstance(invite, str):
+        try:
+            parsed = urlsplit(invite)
+        except ValueError:
+            return None
+        if (parsed.scheme == "https" and parsed.netloc == "t.me" and not parsed.query and not parsed.fragment
+                and re.fullmatch(r"/(?:\+|joinchat/)[A-Za-z0-9_-]+", parsed.path)):
+            return invite
+    return None
+
+
+async def publication_confirmation(message, context, event, text=SETUP_SUCCESS):
+    url = None
+    try:
+        chat = await context.bot.get_chat(event["chat_id"])
+        if chat.id == event["chat_id"]:
+            url = group_return_url(chat, event["message_id"])
+    except TelegramError:
+        pass  # A missing optional link must not turn a committed publication into a failure.
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Вернуться в группу", url=url)]]) if url else None
+    await message.reply_text(text, reply_markup=markup)
+
+
 async def creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -458,7 +499,8 @@ async def creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if existing and existing["message_id"] is not None:
         await query.answer("Игра уже опубликована.")
-        await query.message.reply_text("Игра уже опубликована в исходной группе. Текущий статус смотри в её карточке.")
+        await publication_confirmation(query.message, context, existing,
+                                       "Игра уже опубликована в исходной группе. Текущий статус смотри в её карточке.")
         return
     draft = setup_session(context, user_id, token)
     if not draft:
@@ -525,7 +567,7 @@ async def creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if active.get(user_id) == token:
         active.pop(user_id, None)
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(SETUP_SUCCESS)
+    await publication_confirmation(query.message, context, db(context).get_event(event["id"]))
 
 
 async def event_from_query(update, context):
