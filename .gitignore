@@ -1,10 +1,44 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
 .venv/
+
+# Python caches and local test/analysis output
 __pycache__/
 *.pyc
-.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local SQLite databases and WAL/SHM/journal sidecars
 *.db
 *.db-*
 *.sqlite
 *.sqlite-*
 *.sqlite3
 *.sqlite3-*
+
+# Logs, temporary files and editor backups
+logs/
+*.log
+*.log.*
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Local IDE and operating-system settings
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
