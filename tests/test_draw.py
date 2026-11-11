@@ -96,12 +96,12 @@ class DrawStorageTests(unittest.TestCase):
             self.complete()
         self.assertEqual(self.pair_ids(), [])
 
-    def test_private_activation_rechecked_inside_transaction(self):
+    def test_draw_persists_without_private_activation(self):
         with self.store.connection:
-            self.store.connection.execute("DELETE FROM users WHERE telegram_user_id = 20")
-        with self.assertRaises(DrawError):
-            self.complete()
-        self.assertEqual(self.pair_ids(), [])
+            self.store.connection.execute("DELETE FROM users")
+        self.complete()
+        self.assertEqual(len(self.pair_ids()), 3)
+        self.assertEqual(self.store.get_event(self.event["id"])["status"], COMPLETED)
 
     def test_too_few_participants_rejected_by_storage(self):
         event = self.store.create_event(-100, 10, "Мало участников", 100, "small")

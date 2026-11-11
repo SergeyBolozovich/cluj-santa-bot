@@ -7,7 +7,8 @@ from uuid import uuid4
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError, Forbidden, RetryAfter
+from telegram.error import BadRequest, TelegramError
+from telegram.helpers import create_deep_linked_url
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters,
     ContextTypes,
@@ -55,7 +56,13 @@ async def prompt_draft(message, draft):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
+        already_active = db(context).private_active(update.effective_user.id)
         db(context).activate_private(update.effective_user.id)
+        if context.args and context.args[0].startswith("activate_"):
+            await update.message.reply_text(
+                "✅ Личные сообщения уже активированы. Повторная активация не нужна."
+                if already_active else "✅ Личные сообщения активированы. Регистрация в играх выполняется отдельно в группе."
+            )
         await show_private_menu(update.message)
 
 
@@ -71,7 +78,7 @@ async def show_private_menu(message):
         "🎅 Тайный Санта\n\nПривет! Здесь ты можешь посмотреть свои игры и узнать, "
         "кому нужно подготовить подарок.\n\n"
         "Для регистрации вернись в группу и нажми «🎁 Присоединиться». "
-        "Перед жеребьёвкой каждому участнику нужен личный /start. Блокировка бота может помешать доставке.",
+        "Для личных результатов используется однократная активация через Start. Блокировка бота может помешать доставке.",
         reply_markup=private_menu_keyboard(),
     )
 
@@ -123,7 +130,9 @@ async def show_help(message, private):
         "В группе: /new или /new название — создать игру с бюджетом в RON; "
         "/cancel — отменить незавершённое создание. Отвечай на вопросы ответом на сообщение бота.\n"
         "«Присоединиться» регистрирует в конкретной игре без возможности выхода. "
-        "Каждый участник должен нажать /start в личном чате. Организатор участвует только после отдельной регистрации.\n"
+        "Сначала можно зарегистрироваться, а затем нажать «📩 Активировать личные сообщения» "
+        "и Start («Запустить») в Telegram. Вручную вводить /start не нужно. "
+        "Повторная активация для других игр не требуется. Организатор участвует только после отдельной регистрации.\n"
         "Организатор подтверждает жеребьёвку минимум для 2 участников. "
         "Отмена открытой игры и повтор неудачных уведомлений доступны через «Управление» в группе.\n\n"
         "В личном чате: /start — главное меню, /mygames — «Мои игры», /help — помощь. "
@@ -265,7 +274,8 @@ def render_event_text(event, participants, username):
     status = {OPEN: "🟢 Регистрация открыта", CANCELLED: "⛔ Игра отменена", COMPLETED: "🎲 Жеребьёвка завершена"}[event["status"]]
     text = (f"🎅 <b>{escape(event['title'])}</b>\n🎁 Бюджет: {format_budget(event['budget'])}\n"
             f"👥 Участников: {len(participants)}\n{status}\n\n"
-            f"Перед жеребьёвкой открой <a href='https://t.me/{escape(username)}'>бота</a> и нажми /start.\n"
+            f"Для личных результатов: <a href='{escape(activation_url(username, event['id']))}'>📩 Активировать личные сообщения</a> "
+            "→ Start («Запустить») в Telegram. Если уже активировано, повторять не нужно.\n"
             "Регистрация необратима.\n\n<b>Участники:</b>\n")
     if not participants:
         return text + "— пока никого"
@@ -357,8 +367,23 @@ async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     name = f"{user.full_name} (@{user.username})" if user.username else user.full_name
     added = db(context).join_event(event["id"], user.id, name)
-    await query.answer("🎉 Ты добавлен! Открой бота и нажми /start." if added else "Ты уже участвуешь.")
+    await query.answer("🎉 Вы зарегистрированы в игре" if added else "✅ Вы уже участвуете в этой игре")
     await refresh_event(context, db(context).get_event(event["id"]))
+    if added and not db(context).private_active(user.id):
+        await query.message.reply_text(
+            f"<a href='tg://user?id={user.id}'>{escape(user.full_name)}</a>, регистрация сохранена!\n"
+            "Для получения результата открой личный чат кнопкой ниже и нажми Start («Запустить»). "
+            "Вручную вводить /start не нужно. Если чат уже активирован, повторять не требуется.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📩 Активировать личные сообщения", url=activation_url(context.bot.username, event["id"]))],
+            ]),
+        )
+
+
+def activation_url(username, event_id):
+    # The link carries event context only. Telegram's /start sender is the identity.
+    return create_deep_linked_url(username, f"activate_{event_id}")
 
 
 async def management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -430,33 +455,6 @@ async def show_draw_confirmation(query, context, event):
             [InlineKeyboardButton("Назад", callback_data=f"draw_no:{eid}:{token}")],
         ]),
     )
-
-
-def telegram_failure_reason(error):
-    if isinstance(error, Forbidden):
-        return "личный чат недоступен или бот заблокирован"
-    if isinstance(error, RetryAfter):
-        return "Telegram ограничил частоту отправки; попробуйте позднее"
-    return "временная ошибка Telegram или сети; попробуйте позднее"
-
-
-async def check_private_delivery(context, event, participants):
-    problems = []
-    for participant in participants:
-        uid = participant["telegram_user_id"]
-        if not db(context).private_active(uid):
-            problems.append((participant["display_name"], "нужно нажать /start в личном чате"))
-    if problems:
-        return problems
-    for participant in participants:
-        try:
-            await context.bot.send_message(
-                participant["telegram_user_id"],
-                f"🎅 Проверка личного чата перед жеребьёвкой «{event['title']}». Результат придёт отдельным сообщением.",
-            )
-        except TelegramError as error:
-            problems.append((participant["display_name"], telegram_failure_reason(error)))
-    return problems
 
 
 async def send_saved_notifications(context, event):
@@ -539,14 +537,7 @@ async def draw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         # Consume confirmation before network requests; repeated taps cannot replay it.
         confirmations.pop(event["id"], None)
-        await query.answer("Проверяю личные чаты…")
-        problems = await check_private_delivery(context, event, participants)
-        if problems:
-            details = "\n".join(f"• {name[:80]}: {reason}" for name, reason in problems)
-            await query.message.reply_text(
-                "Жеребьёвка не началась. Исправьте проблемы и запросите новое подтверждение:\n" + details[:3000]
-            )
-            return
+        await query.answer("Сохраняю жеребьёвку…")
         try:
             db(context).complete_draw(event["id"], query.from_user.id, ids)
         except ParticipantsChanged:

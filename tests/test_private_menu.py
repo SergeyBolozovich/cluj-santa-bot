@@ -21,7 +21,7 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         self.store = Storage(self.path)
         self.reply = AsyncMock()
         self.context = SimpleNamespace(
-            bot_data={"storage": self.store},
+            bot_data={"storage": self.store}, args=[],
             bot=SimpleNamespace(username="TestSantaBot", send_message=AsyncMock()),
         )
 

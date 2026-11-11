@@ -167,8 +167,6 @@ class Storage:
                 raise DrawError("Нужно минимум 2 участника.")
             if set(ids) != set(expected_ids):
                 raise ParticipantsChanged("Состав участников изменился. Требуется новое подтверждение.")
-            if any(not self.private_active(uid) for uid in ids):
-                raise DrawError("Не все участники нажали /start в личном чате.")
             pairs = (generator or make_pairs)(ids)
             if (not pairs or len(pairs) != len(ids)
                     or {giver for giver, _ in pairs} != set(ids)

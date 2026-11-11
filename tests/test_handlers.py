@@ -265,24 +265,25 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([dict(r) for r in self.store.assignments(event["id"])], pairs)
         self.context.bot.send_message.assert_not_awaited()
 
-    async def test_missing_private_activation_blocks_draw(self):
+    async def test_missing_private_activation_does_not_block_draw(self):
         event = self.ready_event()
+        confirm = await self.request_draw(event)
         with self.store.connection:
             self.store.connection.execute("DELETE FROM users WHERE telegram_user_id = 20")
-        confirm = await self.request_draw(event)
         await bot.draw_callback(confirm, self.context)
-        self.assertEqual(self.store.assignments(event["id"]), [])
-        self.context.bot.send_message.assert_not_awaited()
-        self.assertIn("/start", self.reply.call_args.args[0])
+        self.assertEqual(len(self.store.assignments(event["id"])), 3)
+        self.assertEqual(self.store.get_event(event["id"])["status"], COMPLETED)
+        self.assertEqual(self.context.bot.send_message.await_count, 3)
 
-    async def test_private_preflight_failure_leaves_game_open(self):
+    async def test_unreachable_chats_keep_completed_draw_and_failed_notifications(self):
         event = self.ready_event()
         self.context.bot.send_message.side_effect = Forbidden("blocked")
         confirm = await self.request_draw(event)
         await bot.draw_callback(confirm, self.context)
-        self.assertEqual(self.store.get_event(event["id"])["status"], OPEN)
-        self.assertEqual(self.store.assignments(event["id"]), [])
-        self.assertIn("бот заблокирован", self.reply.call_args.args[0])
+        self.assertEqual(self.store.get_event(event["id"])["status"], COMPLETED)
+        self.assertEqual(len(self.store.assignments(event["id"])), 3)
+        self.assertEqual(self.store.notification_counts(event["id"])["failed"], 3)
+        self.assertIn("ошибок: 3", self.reply.call_args.args[0])
 
     async def test_assignments_are_committed_before_first_result_send(self):
         event = self.ready_event()
@@ -310,10 +311,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await bot.draw_callback(confirm, self.context)
         self.assertEqual(self.store.assignments(event["id"]), [])
         self.assertEqual(self.store.get_event(event["id"])["status"], OPEN)
-        # Preflight is allowed before commit; result messages are not.
-        self.assertEqual(self.context.bot.send_message.await_count, 3)
-        for call in self.context.bot.send_message.call_args_list:
-            self.assertNotIn("Ты даришь подарок:", call.args[1])
+        self.context.bot.send_message.assert_not_awaited()
 
     async def test_notification_failure_continues_and_retry_preserves_pairs(self):
         event = self.ready_event()
@@ -405,7 +403,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await first
         self.assertEqual(len(self.store.assignments(event["id"])), 2)
-        self.assertEqual(self.context.bot.send_message.await_count, 4)  # 2 probes + 2 results.
+        self.assertEqual(self.context.bot.send_message.await_count, 2)  # Results only, after commit.
 
     async def test_completed_management_shows_counts_and_retry_only(self):
         event = self.ready_event()
