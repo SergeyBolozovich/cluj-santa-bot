@@ -64,6 +64,10 @@ class Storage:
                 FOREIGN KEY (event_id, receiver_user_id)
                     REFERENCES participants(event_id, telegram_user_id)
             );
+            CREATE TABLE IF NOT EXISTS event_publications (
+                event_id INTEGER PRIMARY KEY REFERENCES events(id),
+                state TEXT NOT NULL CHECK(state IN ('sending', 'failed', 'uncertain', 'published'))
+            );
         """)
 
     def close(self):
@@ -85,6 +89,34 @@ class Storage:
 
     def get_event(self, event_id):
         return self.connection.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+
+    def claim_publication(self, event_id):
+        """Persist the send claim before Telegram; never automatically resend an uncertain send."""
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            event = self.get_event(event_id)
+            if event["message_id"] is not None:
+                return "published"
+            row = self.connection.execute("SELECT state FROM event_publications WHERE event_id=?", (event_id,)).fetchone()
+            if row and row["state"] in {"sending", "uncertain"}:
+                return "uncertain"
+            self.connection.execute(
+                "INSERT INTO event_publications(event_id,state) VALUES (?, 'sending') "
+                "ON CONFLICT(event_id) DO UPDATE SET state='sending'", (event_id,),
+            )
+        return "send"
+
+    def record_publication(self, event_id, state, message_id=None):
+        if state not in {"failed", "uncertain", "published"} or (state == "published" and not message_id):
+            raise ValueError("Некорректное состояние публикации.")
+        with self.connection:
+            self.connection.execute("UPDATE event_publications SET state=? WHERE event_id=?", (state, event_id))
+            if state == "published":
+                self.connection.execute("UPDATE events SET message_id=? WHERE id=?", (message_id, event_id))
+
+    def publication_state(self, event_id):
+        row = self.connection.execute("SELECT state FROM event_publications WHERE event_id=?", (event_id,)).fetchone()
+        return row["state"] if row else None
 
     def get_event_by_creation_key(self, key):
         return self.connection.execute("SELECT * FROM events WHERE creation_key = ?", (key,)).fetchone()

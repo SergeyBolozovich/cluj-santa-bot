@@ -27,8 +27,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.reply = AsyncMock(side_effect=reply)
         self.context = SimpleNamespace(
             args=[], bot_data={"storage": self.store},
-            bot=SimpleNamespace(username="TestSantaBot", edit_message_text=AsyncMock(), send_message=AsyncMock()),
+            bot=SimpleNamespace(username="TestSantaBot", edit_message_text=AsyncMock(), send_message=AsyncMock(),
+                                get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member"))),
         )
+        self.context.bot.send_message.return_value = self.message(700)
 
     def tearDown(self):
         self.store.close()
@@ -54,45 +56,51 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             message=message, callback_query=query,
         )
 
+    async def open_setup(self, user_id=10, chat_id=-100):
+        await bot.new_event(self.update(user_id=user_id, chat_id=chat_id), self.context)
+        draft = bot.drafts(self.context)[(chat_id, user_id)]
+        self.context.args = [f"setup_{draft['key']}"]
+        await bot.start(self.update(user_id=user_id, chat_id=user_id, chat_type="private"), self.context)
+        return draft
+
+    def setup_update(self, draft, text="", action=None):
+        update = self.update(user_id=draft["owner_id"], chat_id=draft["owner_id"], chat_type="private",
+                             text=text, data=f"{action}:{draft['key']}" if action else None)
+        update.message.message_id = draft["prompt_id"]
+        return update
+
     async def test_creation_with_arguments_and_repeated_confirmation(self):
-        self.context.args = ["Тайный", "Санта"]
-        update = self.update()
-        await bot.new_event(update, self.context)
-        draft = bot.drafts(self.context)[(-100, 10)]
-        self.assertEqual(draft["title"], "Тайный Санта")
-        self.assertEqual(draft["step"], "budget")
-        reply_to = self.message(draft["prompt_id"])
-        await bot.creation_input(self.update(text="100,50", reply_to=reply_to), self.context)
-        self.assertEqual(draft["step"], "confirm")
-        self.assertEqual(draft["budget"], 10050)
-        confirm = self.update(data=f"create:{draft['key']}")
+        self.context.args = ["Название", "в", "группе"]
+        draft = await self.open_setup()
+        self.assertEqual(draft["step"], "title")
+        await bot.creation_input(self.setup_update(draft, "Тайный Санта"), self.context)
+        await bot.creation_input(self.setup_update(draft, "100,50"), self.context)
+        confirm = self.setup_update(draft, action="create")
         await bot.creation_callback(confirm, self.context)
         event = self.store.get_event_by_creation_key(draft["key"])
+        self.assertEqual(event["title"], "Тайный Санта")
         self.assertEqual(event["budget"], 10050)
+        self.assertEqual(event["message_id"], 700)
+        self.assertEqual(event["chat_id"], -100)
         self.assertEqual(self.store.participants(event["id"]), [])
-        self.assertNotIn((-100, 10), bot.drafts(self.context))
         await bot.creation_callback(confirm, self.context)
-        self.assertEqual(self.store.get_event_by_creation_key(draft["key"])["id"], event["id"])
-        self.assertEqual(self.store.connection.execute("SELECT count(*) FROM events").fetchone()[0], 1)
+        self.context.bot.send_message.assert_awaited_once()
 
     async def test_creation_without_title_and_invalid_budget(self):
-        await bot.new_event(self.update(), self.context)
-        draft = bot.drafts(self.context)[(-100, 10)]
-        self.assertEqual(draft["step"], "title")
-        await bot.creation_input(self.update(text="  Санта  ", reply_to=self.message(draft["prompt_id"])), self.context)
+        draft = await self.open_setup()
+        await bot.creation_input(self.setup_update(draft, "  Санта  "), self.context)
+        await bot.creation_input(self.setup_update(draft, "0"), self.context)
         self.assertEqual(draft["title"], "Санта")
-        await bot.creation_input(self.update(text="0", reply_to=self.message(draft["prompt_id"])), self.context)
         self.assertEqual(draft["step"], "budget")
         self.assertNotIn("budget", draft)
 
     async def test_replies_are_scoped_to_organizer_chat_and_prompt(self):
-        await bot.new_event(self.update(), self.context)
-        draft = bot.drafts(self.context)[(-100, 10)]
-        prompt = self.message(draft["prompt_id"])
-        for update in (self.update(user_id=20, text="Чужое", reply_to=prompt),
-                       self.update(chat_id=-200, text="Чужое", reply_to=prompt),
-                       self.update(text="Без ответа"),
-                       self.update(text="Старый ответ", reply_to=self.message(999))):
+        draft = await self.open_setup()
+        for update in (self.update(user_id=20, chat_id=20, chat_type="private", text="Чужой"),
+                       self.update(text="Группа"),
+                       self.setup_update(draft, "Старый ответ")):
+            if update.message.text == "Старый ответ":
+                update.message.reply_to_message = self.message(999)
             await bot.creation_input(update, self.context)
         self.assertEqual(draft["step"], "title")
 
@@ -101,34 +109,29 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.drafts(self.context), {})
 
     async def test_distinct_drafts_and_cancellation(self):
-        await bot.new_event(self.update(), self.context)
-        await bot.new_event(self.update(user_id=20), self.context)
-        first = bot.drafts(self.context)[(-100, 10)]
-        await bot.new_event(self.update(), self.context)
-        self.assertIs(bot.drafts(self.context)[(-100, 10)], first)
-        foreign = self.update(user_id=20, data=f"discard:{first['key']}")
+        first = await self.open_setup()
+        second = await self.open_setup(user_id=20)
+        foreign = self.update(user_id=20, chat_id=20, chat_type="private", data=f"discard:{first['key']}")
         await bot.creation_callback(foreign, self.context)
         self.assertIn((-100, 10), bot.drafts(self.context))
         await bot.cancel_creation(self.update(), self.context)
         self.assertNotIn((-100, 10), bot.drafts(self.context))
-        self.assertIn((-100, 20), bot.drafts(self.context))
-        second = bot.drafts(self.context)[(-100, 20)]
-        await bot.creation_callback(self.update(user_id=20, data=f"discard:{second['key']}"), self.context)
+        await bot.creation_callback(self.setup_update(second, action="discard"), self.context)
         self.assertEqual(bot.drafts(self.context), {})
 
     async def test_stale_creation_button_after_restart(self):
-        update = self.update(data="create:" + "a" * 32)
+        update = self.update(chat_type="private", data="create:" + "a" * 32)
         await bot.creation_callback(update, self.context)
         self.assertEqual(self.store.connection.execute("SELECT count(*) FROM events").fetchone()[0], 0)
         update.callback_query.answer.assert_awaited_once()
 
     async def test_saved_confirmation_recovery_keeps_new_draft(self):
         event = self.store.create_event(-100, 10, "Санта", 100, "a" * 32, 123)
-        await bot.new_event(self.update(), self.context)
-        current = bot.drafts(self.context)[(-100, 10)]
-        await bot.creation_callback(self.update(data="create:" + "a" * 32), self.context)
-        self.assertIs(bot.drafts(self.context)[(-100, 10)], current)
-        self.assertEqual(self.context.bot.edit_message_text.call_args.kwargs["message_id"], event["message_id"])
+        draft = await self.open_setup()
+        await bot.creation_callback(self.update(chat_type="private", data="create:" + "a" * 32), self.context)
+        self.assertIs(bot.drafts(self.context)[(-100, 10)], draft)
+        self.assertEqual(self.store.get_event(event["id"])["message_id"], 123)
+        self.context.bot.send_message.assert_not_awaited()
 
     async def test_join_independent_events_and_duplicate_updates(self):
         first = self.store.create_event(-100, 10, "Первая", 100, "first", 123)

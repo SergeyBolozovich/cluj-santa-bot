@@ -4,10 +4,11 @@ import sqlite3
 from html import escape
 from pathlib import Path
 from uuid import uuid4
+from time import monotonic
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, Forbidden, RetryAfter
 from telegram.helpers import create_deep_linked_url
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters,
@@ -19,6 +20,7 @@ from validation import validate_title, parse_budget, format_budget
 from messages import (
     GROUP_INTRO, REGISTRATION_SUCCESS, REGISTRATION_REPEAT, REGISTRATION_NOTICE,
     DRAW_COMPLETED, MAIN_MENU, WAITING, CANCELLED_GAME, CLOSED, TOO_FEW, assignment_text,
+    SETUP_INVITE, SETUP_TITLE, SETUP_BUDGET, SETUP_SUCCESS,
 )
 
 
@@ -34,28 +36,76 @@ def drafts(context):
     return context.bot_data.setdefault("drafts", {})
 
 
+SETUP_TTL = 30 * 60
+
+
 def draft_key(update):
     return update.effective_chat.id, update.effective_user.id
 
 
+def setup_session(context, user_id, token=None):
+    if token is None:
+        token = context.bot_data.setdefault("active_setups", {}).get(user_id)
+    for key, draft in list(drafts(context).items()):
+        if draft["key"] == token:
+            if draft["expires_at"] <= monotonic():
+                drafts(context).pop(key, None)
+                return None
+            return draft if draft["owner_id"] == user_id else None
+    return None
+
+
+async def allowed_organizer(context, chat_id, user_id):
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except TelegramError:
+        return False
+    return member.status in {"creator", "administrator", "member"} or (
+        member.status == "restricted" and member.is_member
+    )
+
+
 def draft_keyboard(draft, confirm=False):
+    token = draft["key"]
     rows = []
     if confirm:
-        rows.append([InlineKeyboardButton("Создать игру", callback_data=f"create:{draft['key']}")])
-    rows.append([InlineKeyboardButton("Отмена", callback_data=f"discard:{draft['key']}")])
+        rows.extend([
+            [InlineKeyboardButton("🎁 Создать игру", callback_data=f"create:{token}")],
+            [InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_setup:{token}")],
+        ])
+    if draft["step"] == "edit":
+        rows.extend([
+            [InlineKeyboardButton("Изменить название", callback_data=f"edit_title:{token}")],
+            [InlineKeyboardButton("Изменить бюджет", callback_data=f"edit_budget:{token}")],
+        ])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"discard:{token}")])
     return InlineKeyboardMarkup(rows)
 
 
 async def prompt_draft(message, draft):
-    if draft["step"] == "title":
-        text = "Введите название игры (1–100 символов). Ответьте на это сообщение."
-    elif draft["step"] == "budget":
-        text = "Введите бюджет: больше 0, до 100 000 RON, максимум 2 знака после запятой. Ответьте на это сообщение."
+    if draft["step"] in {"title", "edit_title"}:
+        text = SETUP_TITLE
+    elif draft["step"] in {"budget", "edit_budget"}:
+        text = SETUP_BUDGET
+    elif draft["step"] == "edit":
+        text = "✏️ Что изменим?"
     else:
-        text = (f"Создать игру «{draft['title']}»?\n"
-                f"Бюджет: {format_budget(draft['budget'])}\nРегистрацию участника отменить нельзя.")
+        text = (f"🎄 Проверим настройки игры!\n\n📝 Название: {draft['title']}\n\n"
+                f"💰 Бюджет: {format_budget(draft['budget'])}")
     sent = await message.reply_text(text, reply_markup=draft_keyboard(draft, draft["step"] == "confirm"))
     draft["prompt_id"] = sent.message_id
+
+
+async def start_setup(update, context, token):
+    draft = setup_session(context, update.effective_user.id, token)
+    if not draft:
+        await update.message.reply_text("Ссылка настройки недоступна или устарела. Отправь /new в нужной группе.")
+        return
+    if not await allowed_organizer(context, draft["chat_id"], draft["owner_id"]):
+        await update.message.reply_text("Не удалось подтвердить участие в исходной группе. Настройка недоступна.")
+        return
+    context.bot_data.setdefault("active_setups", {})[update.effective_user.id] = token
+    await prompt_draft(update.message, draft)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -65,6 +115,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Every START can repair a previously failed edit; all games share the same SS-4 state.
         for event in db(context).participant_announcements(update.effective_user.id):
             await refresh_event(context, event)
+        if context.args and context.args[0].startswith("setup_"):
+            await start_setup(update, context, context.args[0][6:])
+            return
         if context.args and context.args[0].startswith("activate_"):
             await update.message.reply_text(
                 "✅ Личные сообщения уже активированы. Повторная активация не нужна."
@@ -139,8 +192,9 @@ async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_help(message, private, edit=False):
     text = (
         "ℹ️ Помощь\n\n"
-        "В группе: /new или /new название — создать игру с бюджетом в RON; "
-        "/cancel — отменить незавершённое создание. Отвечай на вопросы ответом на сообщение бота.\n"
+        "В группе: /new или /new название — получить ссылку «⚙️ Настроить игру». "
+        "Название и бюджет в RON вводятся в личном чате, там же доступны изменение и подтверждение. "
+        "/cancel — отменить выбранное создание в личном чате или собственный черновик исходной группы.\n"
         "«Присоединиться» регистрирует в конкретной игре без возможности выхода. "
         "Сначала можно зарегистрироваться, а затем нажать «📩 Открыть бота» "
         "и Start («Запустить») в Telegram. Вручную вводить /start не нужно. "
@@ -263,57 +317,78 @@ async def private_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group(update):
-        await update.message.reply_text("Создать игру можно только в группе.")
+        await update.message.reply_text("Начни создание командой /new в нужной группе.")
+        return
+    user = update.effective_user
+    if (getattr(user, "is_bot", False) or getattr(update.message, "sender_chat", None)
+            or not await allowed_organizer(context, update.effective_chat.id, user.id)):
+        await update.message.reply_text("Создание доступно участнику группы от своего имени. Не удалось подтвердить права.")
         return
     key = draft_key(update)
-    if key in drafts(context):
-        draft = drafts(context)[key]
-        await update.message.reply_text(
-            "У тебя уже есть черновик. Продолжи его или отмени через /cancel и отправь /new заново."
-        )
-        await prompt_draft(update.message, draft)
-        return
-    draft = {"key": uuid4().hex, "step": "title"}
-    drafts(context)[key] = draft
-    if context.args:
-        try:
-            draft["title"] = validate_title(" ".join(context.args))
-            draft["step"] = "budget"
-        except ValueError as exc:
-            await update.message.reply_text(str(exc))
-    await prompt_draft(update.message, draft)
+    draft = drafts(context).get(key)
+    if not draft or draft["expires_at"] <= monotonic():
+        draft = {"key": uuid4().hex, "step": "title", "chat_id": key[0], "owner_id": key[1],
+                 "expires_at": monotonic() + SETUP_TTL}
+        drafts(context)[key] = draft
+    await update.message.reply_text(
+        SETUP_INVITE,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "⚙️ Настроить игру", url=create_deep_linked_url(context.bot.username, f"setup_{draft['key']}")
+        )]]),
+    )
+
+
+async def discard_setup(context, draft):
+    event = db(context).get_event_by_creation_key(draft["key"])
+    if event:
+        state = db(context).publication_state(event["id"])
+        if event["message_id"] is not None or state in {"sending", "uncertain"}:
+            return False
+        db(context).cancel_event(event["id"], draft["owner_id"])
+    drafts(context).pop((draft["chat_id"], draft["owner_id"]), None)
+    active = context.bot_data.setdefault("active_setups", {})
+    if active.get(draft["owner_id"]) == draft["key"]:
+        active.pop(draft["owner_id"], None)
+    return True
 
 
 async def cancel_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_group(update):
-        return
-    removed = drafts(context).pop(draft_key(update), None)
-    existing = db(context).get_event_by_creation_key(removed["key"]) if removed else None
-    if existing:
-        await update.message.reply_text("Игра уже создана. Для её отмены открой «⚙️ Управление».")
-        await refresh_event(context, existing)
+    if is_group(update):
+        draft = drafts(context).get(draft_key(update))
+    elif update.effective_chat.type == ChatType.PRIVATE:
+        draft = setup_session(context, update.effective_user.id)
     else:
-        await update.message.reply_text("Создание отменено." if removed else "Нет незавершённого создания.")
+        return
+    if not draft:
+        text = "Нет незавершённого создания."
+    elif await discard_setup(context, draft):
+        text = "Создание отменено."
+    else:
+        text = "Публикация уже выполнена или её исход неизвестен. Проверь исходную группу; повторная отправка заблокирована."
+    await update.message.reply_text(text)
 
 
 async def creation_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_group(update):
+    if update.effective_chat.type != ChatType.PRIVATE:
         return
-    draft = drafts(context).get(draft_key(update))
+    draft = setup_session(context, update.effective_user.id)
+    if not draft:
+        return
     reply = update.message.reply_to_message
-    if not draft or not reply or reply.message_id != draft.get("prompt_id"):
+    if reply and reply.message_id != draft.get("prompt_id"):
         return
     try:
-        if draft["step"] == "title":
+        if draft["step"] in {"title", "edit_title"}:
+            editing = draft["step"] == "edit_title"
             draft["title"] = validate_title(update.message.text)
-            draft["step"] = "budget"
-        elif draft["step"] == "budget":
+            draft["step"] = "confirm" if editing else "budget"
+        elif draft["step"] in {"budget", "edit_budget"}:
             draft["budget"] = parse_budget(update.message.text)
             draft["step"] = "confirm"
         else:
             return
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
+    except ValueError as error:
+        await update.message.reply_text(str(error))
     await prompt_draft(update.message, draft)
 
 
@@ -372,43 +447,85 @@ async def refresh_event(context, event):
 
 async def creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_group(update):
-        await query.answer("Создание доступно только в группе.")
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await query.answer("Настройка доступна только в личном чате. Начни с /new в группе.", show_alert=True)
         return
     action, token = query.data.split(":", 1)
-    key = draft_key(update)
+    user_id = query.from_user.id
     existing = db(context).get_event_by_creation_key(token)
-    if existing:
-        if (existing["chat_id"], existing["organizer_id"]) != key:
-            await query.answer("Это создание принадлежит другому организатору.", show_alert=True)
-            return
-        await query.answer("Игра уже создана. Обновляю карточку.")
-        await refresh_event(context, existing)
-        current = drafts(context).get(key)
-        if current and current["key"] == token:
-            drafts(context).pop(key, None)
+    if existing and existing["organizer_id"] != user_id:
+        await query.answer("Эта настройка принадлежит другому организатору.", show_alert=True)
         return
-    draft = drafts(context).get(key)
-    if not draft or draft["key"] != token:
-        await query.answer("Черновик недоступен. Начни с /new или используй свой черновик.", show_alert=True)
+    if existing and existing["message_id"] is not None:
+        await query.answer("Игра уже опубликована.")
+        await query.message.reply_text("Игра уже опубликована в исходной группе. Текущий статус смотри в её карточке.")
+        return
+    draft = setup_session(context, user_id, token)
+    if not draft:
+        await query.answer("Настройка устарела. Начни с /new в исходной группе.", show_alert=True)
         return
     if action == "discard":
-        drafts(context).pop(key)
-        await query.answer("Создание отменено.")
-        await query.edit_message_reply_markup(reply_markup=None)
+        removed = await discard_setup(context, draft)
+        await query.answer("Создание отменено." if removed else "Исход публикации неизвестен. Проверь группу.", show_alert=True)
+        if removed:
+            await query.edit_message_reply_markup(reply_markup=None)
         return
-    if draft["step"] != "confirm":
+    if query.message.message_id != draft.get("prompt_id"):
+        await query.answer("Это старое сообщение настройки. Используй последнее или открой ссылку заново.", show_alert=True)
+        return
+    if existing:
+        # Values are frozen once a publication attempt has been claimed.
+        if action != "create":
+            await query.answer("После попытки публикации изменение настроек недоступно. Повтори публикацию или отмени создание.", show_alert=True)
+            return
+    elif action == "edit_setup" and draft["step"] == "confirm":
+        draft["step"] = "edit"
+    elif action in {"edit_title", "edit_budget"} and draft["step"] == "edit":
+        draft["step"] = action
+    elif action != "create" or draft["step"] != "confirm":
         await query.answer("Сначала введи название и бюджет.", show_alert=True)
         return
-    # Reuse the confirmation message as the event card: no send/commit gap.
-    event = db(context).create_event(
-        key[0], key[1], draft["title"], draft["budget"], token, query.message.message_id
-    )
+    if action != "create":
+        context.bot_data.setdefault("active_setups", {})[user_id] = token
+        await query.answer()
+        await prompt_draft(query.message, draft)
+        return
+    if not await allowed_organizer(context, draft["chat_id"], user_id):
+        await query.answer("Публикация запрещена: не удалось подтвердить участие в исходной группе.", show_alert=True)
+        return
+    if setup_session(context, user_id, token) is not draft or draft["step"] != "confirm":
+        await query.answer("Настройка истекла или изменилась. Начни с /new в исходной группе.", show_alert=True)
+        return
+    event = db(context).create_event(draft["chat_id"], user_id, draft["title"], draft["budget"], token)
+    state = db(context).claim_publication(event["id"])
+    if state != "send":
+        await query.answer("Публикация уже выполнена или её исход неизвестен. Проверь группу; повтор не отправлен.", show_alert=True)
+        return
     await query.answer("Публикую игру…")
-    if event["message_id"] is None:
-        db(context).set_message_id(event["id"], query.message.message_id)
-    await refresh_event(context, db(context).get_event(event["id"]))
-    drafts(context).pop(key, None)
+    try:
+        announcement = await context.bot.send_message(
+            chat_id=event["chat_id"], text=render_event_text(event, [], context.bot.username),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=event_keyboard(event),
+        )
+    except (Forbidden, BadRequest, RetryAfter):
+        db(context).record_publication(event["id"], "failed")
+        await query.message.reply_text("Не удалось опубликовать игру. Проверь права бота в группе и повтори «🎁 Создать игру». Успех не подтверждён.")
+        return
+    except TelegramError:
+        db(context).record_publication(event["id"], "uncertain")
+        await query.message.reply_text("Не удалось подтвердить результат отправки. Объявление могло появиться в группе. Повторная отправка заблокирована во избежание дубликата; требуется ручная проверка.")
+        return
+    try:
+        db(context).record_publication(event["id"], "published", announcement.message_id)
+    except sqlite3.Error:
+        await query.message.reply_text("Объявление отправлено, но ID не удалось сохранить. Не повторяй создание: проверь группу и восстанови ID сообщения в базе вручную.")
+        return
+    drafts(context).pop((draft["chat_id"], user_id), None)
+    active = context.bot_data.setdefault("active_setups", {})
+    if active.get(user_id) == token:
+        active.pop(user_id, None)
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(SETUP_SUCCESS)
 
 
 async def event_from_query(update, context):
@@ -686,7 +803,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("new", new_event))
     app.add_handler(CommandHandler("cancel", cancel_creation))
-    app.add_handler(CallbackQueryHandler(creation_callback, pattern=r"^(create|discard):[a-f0-9]{32}$"))
+    app.add_handler(CallbackQueryHandler(creation_callback, pattern=r"^(create|discard|edit_setup|edit_title|edit_budget):[a-f0-9]{32}$"))
     app.add_handler(CallbackQueryHandler(join_callback, pattern=r"^join:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(management_callback, pattern=r"^(manage|cancel_ask|cancel_yes|cancel_no):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(draw_callback, pattern=r"^draw:[0-9]+$"))
@@ -694,7 +811,7 @@ def main():
     app.add_handler(CallbackQueryHandler(retry_callback, pattern=r"^retry:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(private_callback, pattern=r"^(?:private_menu|private_help|(?:games|game|recipient|gifts|gift|view):.*)$"))
     app.add_handler(CallbackQueryHandler(legacy_callback, pattern=r"^(join|draw|noop)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, creation_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, creation_input))
     app.add_error_handler(on_error)
     app.run_polling()
 
