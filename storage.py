@@ -1,11 +1,20 @@
 """Minimal SQLite repository; importing it does not create files."""
 import sqlite3
 from pathlib import Path
+from draw import make_pairs
 from validation import validate_title
 
 OPEN = "registration_open"
 COMPLETED = "draw_completed"
 CANCELLED = "cancelled"
+
+
+class DrawError(ValueError):
+    """Safe message that may be shown to an organizer; never contains pairs."""
+
+
+class ParticipantsChanged(DrawError):
+    pass
 
 
 class Storage:
@@ -40,6 +49,20 @@ class Storage:
             CREATE TABLE IF NOT EXISTS users (
                 telegram_user_id INTEGER PRIMARY KEY,
                 private_started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS assignments (
+                event_id INTEGER NOT NULL REFERENCES events(id),
+                giver_user_id INTEGER NOT NULL,
+                receiver_user_id INTEGER NOT NULL,
+                notification_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(notification_status IN ('pending', 'sent', 'failed')),
+                PRIMARY KEY (event_id, giver_user_id),
+                UNIQUE (event_id, receiver_user_id),
+                CHECK(giver_user_id != receiver_user_id),
+                FOREIGN KEY (event_id, giver_user_id)
+                    REFERENCES participants(event_id, telegram_user_id),
+                FOREIGN KEY (event_id, receiver_user_id)
+                    REFERENCES participants(event_id, telegram_user_id)
             );
         """)
 
@@ -94,14 +117,66 @@ class Storage:
             )
         return cursor.rowcount == 1
 
-    def mark_completed(self, event_id, organizer_id):
-        """Legacy draw only; SS-2 will persist assignments atomically."""
+    def complete_draw(self, event_id, organizer_id, expected_ids, generator=None):
+        """Lock, revalidate, generate and commit all pairs + status, or nothing.
+
+        BEGIN IMMEDIATE serializes writers even across separate connections.
+        This method is synchronous: never await Telegram inside its transaction.
+        """
         with self.connection:
-            cursor = self.connection.execute(
-                "UPDATE events SET status = ? WHERE id = ? AND organizer_id = ? AND status = ?",
-                (COMPLETED, event_id, organizer_id, OPEN),
+            self.connection.execute("BEGIN IMMEDIATE")
+            event = self.get_event(event_id)
+            if not event or event["organizer_id"] != organizer_id:
+                raise DrawError("Жеребьёвка доступна только организатору игры.")
+            if event["status"] != OPEN:
+                raise DrawError("Игра отменена или жеребьёвка уже завершена.")
+            ids = [p["telegram_user_id"] for p in self.participants(event_id)]
+            if len(ids) < 2:
+                raise DrawError("Нужно минимум 2 участника.")
+            if set(ids) != set(expected_ids):
+                raise ParticipantsChanged("Состав участников изменился. Требуется новое подтверждение.")
+            if any(not self.private_active(uid) for uid in ids):
+                raise DrawError("Не все участники нажали /start в личном чате.")
+            pairs = (generator or make_pairs)(ids)
+            if (not pairs or len(pairs) != len(ids)
+                    or {giver for giver, _ in pairs} != set(ids)
+                    or {receiver for _, receiver in pairs} != set(ids)
+                    or any(giver == receiver for giver, receiver in pairs)):
+                raise DrawError("Не удалось создать корректные назначения. Подтверди заново.")
+            self.connection.executemany(
+                "INSERT INTO assignments(event_id, giver_user_id, receiver_user_id) VALUES (?, ?, ?)",
+                [(event_id, giver, receiver) for giver, receiver in pairs],
             )
-        return cursor.rowcount == 1
+            self.connection.execute("UPDATE events SET status = ? WHERE id = ?", (COMPLETED, event_id))
+
+    def assignments(self, event_id, unsent_only=False):
+        condition = " AND a.notification_status IN ('pending', 'failed')" if unsent_only else ""
+        return self.connection.execute(
+            """SELECT a.*, p.display_name AS receiver_name FROM assignments a
+               JOIN participants p ON p.event_id = a.event_id
+                   AND p.telegram_user_id = a.receiver_user_id
+               WHERE a.event_id = ?""" + condition + " ORDER BY a.giver_user_id",
+            (event_id,),
+        ).fetchall()
+
+    def set_notification_status(self, event_id, giver_id, status):
+        if status not in {"sent", "failed"}:
+            raise ValueError("Некорректный статус уведомления.")
+        with self.connection:
+            self.connection.execute(
+                """UPDATE assignments SET notification_status = ?
+                   WHERE event_id = ? AND giver_user_id = ?""",
+                (status, event_id, giver_id),
+            )
+
+    def notification_counts(self, event_id):
+        counts = {"pending": 0, "sent": 0, "failed": 0}
+        for row in self.connection.execute(
+            "SELECT notification_status, count(*) AS total FROM assignments WHERE event_id = ? GROUP BY notification_status",
+            (event_id,),
+        ):
+            counts[row["notification_status"]] = row["total"]
+        return counts
 
     def activate_private(self, user_id):
         with self.connection:

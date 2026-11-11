@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from storage import Storage, OPEN, CANCELLED, COMPLETED
+from storage import Storage, OPEN, CANCELLED, COMPLETED, DrawError
 
 
 class StorageTests(unittest.TestCase):
@@ -79,9 +79,14 @@ class StorageTests(unittest.TestCase):
 
     def test_completed_event_cannot_be_cancelled_or_joined(self):
         event = self.event()
-        self.assertFalse(self.store.mark_completed(event["id"], 99))
-        self.assertTrue(self.store.mark_completed(event["id"], 10))
-        self.assertFalse(self.store.mark_completed(event["id"], 10))
+        for uid in (20, 30):
+            self.store.join_event(event["id"], uid, "Участник")
+            self.store.activate_private(uid)
+        with self.assertRaises(DrawError):
+            self.store.complete_draw(event["id"], 99, [20, 30])
+        self.store.complete_draw(event["id"], 10, [20, 30])
+        with self.assertRaises(DrawError):
+            self.store.complete_draw(event["id"], 10, [20, 30])
         self.assertFalse(self.store.cancel_event(event["id"], 10))
         self.assertFalse(self.store.join_event(event["id"], 20, "Анна"))
         self.assertEqual(self.store.get_event(event["id"])["status"], COMPLETED)
