@@ -117,8 +117,8 @@ class NavigationPolishTests(unittest.IsolatedAsyncioTestCase):
         event = self.store.create_event(-100, 10, "Наша игра", 7000, "copy")
         text = bot.render_event_text(event, [], "TestSantaBot")
         expected = ("📩 Секретная миссия ждёт тебя!\n\n"
-                    "🧝 Чтобы эльфы смогли доставить тебе секретное задание, открой личный чат с ботом и активируй его.\n\n"
-                    "🎁 Уже общался с ботом? Отлично! Просто жди жеребьёвки.")
+                    "🧝 Чтобы эльфы смогли доставить тебе секретное задание, нажми «🎁 Присоединиться», а затем открой личный чат с ботом и активируй его.\n\n"
+                    "🎄 Уже активировал бота? Тогда всё готово!")
         self.assertEqual(text.count(expected), 1)
         self.assertEqual(text.count("📩 Открыть бота"), 1)
         self.assertIn(f"https://t.me/TestSantaBot?start=activate_{event['id']}", text)
@@ -130,7 +130,7 @@ class NavigationPolishTests(unittest.IsolatedAsyncioTestCase):
     async def test_warning_is_visible_before_join_and_activation_tracking_is_preserved(self):
         event = self.store.create_event(-100, 10, "Наша игра", 7000, "copy", 700)
         text = bot.render_event_text(event, [], "TestSantaBot")
-        self.assertIn("🎅 Вступаешь в команду Санты всерьёз — после регистрации выйти из игры самостоятельно нельзя.", text)
+        self.assertEqual(text.count("🎅 Вписался за Санту — теперь отвечай! 🎁 Обратных билетов у эльфов нет."), 1)
         self.assertNotIn("Регистрация необратима.", text)
         self.assertIn(f"join:{event['id']}", [b.callback_data for row in bot.event_keyboard(event).inline_keyboard for b in row])
         self.store.activate_private(20)
