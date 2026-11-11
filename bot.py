@@ -16,6 +16,10 @@ from telegram.ext import (
 
 from storage import Storage, OPEN, CANCELLED, COMPLETED, DrawError, ParticipantsChanged
 from validation import validate_title, parse_budget, format_budget
+from messages import (
+    GROUP_INTRO, REGISTRATION_SUCCESS, REGISTRATION_REPEAT, REGISTRATION_NOTICE,
+    DRAW_COMPLETED, MAIN_MENU, WAITING, CANCELLED_GAME, CLOSED, TOO_FEW, assignment_text,
+)
 
 
 def is_group(update):
@@ -58,6 +62,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         already_active = db(context).private_active(update.effective_user.id)
         db(context).activate_private(update.effective_user.id)
+        # Every START can repair a previously failed edit; all games share the same SS-4 state.
+        for event in db(context).participant_announcements(update.effective_user.id):
+            await refresh_event(context, event)
         if context.args and context.args[0].startswith("activate_"):
             await update.message.reply_text(
                 "✅ Личные сообщения уже активированы. Повторная активация не нужна."
@@ -69,29 +76,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def private_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎁 Мои игры", callback_data="games:0")],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data="private_help")],
+        [InlineKeyboardButton("🎯 Кому я дарю?", callback_data="gifts:0")],
+        [InlineKeyboardButton("❓ Как это работает", callback_data="private_help")],
     ])
 
 
-async def show_private_menu(message):
-    await message.reply_text(
-        "🎅 Тайный Санта\n\nПривет! Здесь ты можешь посмотреть свои игры и узнать, "
-        "кому нужно подготовить подарок.\n\n"
-        "Для регистрации вернись в группу и нажми «🎁 Присоединиться». "
-        "Для личных результатов используется однократная активация через Start. Блокировка бота может помешать доставке.",
-        reply_markup=private_menu_keyboard(),
-    )
+async def private_message(message, text, *, edit=False, **kwargs):
+    if not edit:
+        return await message.reply_text(text, **kwargs)
+    try:
+        return await message.edit_text(text, **kwargs)
+    except BadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            raise
+
+
+async def show_private_menu(message, edit=False):
+    await private_message(message, MAIN_MENU, edit=edit, reply_markup=private_menu_keyboard())
 
 
 def private_event_text(event):
-    statuses = {OPEN: "🟢 Регистрация открыта", COMPLETED: "🎲 Жеребьёвка завершена", CANCELLED: "⛔ Игра отменена"}
+    statuses = {OPEN: "🟢 Регистрация открыта", COMPLETED: "🎲 Жеребьёвка завершена", CANCELLED: CANCELLED_GAME}
     return (f"🎅 <b>{escape(event['title'])}</b> · №{event['id']}\n"
             f"💰 Бюджет: {format_budget(event['budget'])}\n"
             f"{statuses.get(event['status'], 'Жеребьёвка ещё не завершена')}\n"
             f"👥 Участников: {event['participant_count']}")
 
 
-async def show_my_games(message, context, user_id, offset=0):
+async def show_my_games(message, context, user_id, offset=0, edit=False):
     page_size = 5
     events = db(context).participant_games(user_id, offset, page_size + 1)
     rows = []
@@ -103,18 +115,18 @@ async def show_my_games(message, context, user_id, offset=0):
     else:
         text = "🎁 <b>Мои игры</b>\n\n" + "\n\n".join(private_event_text(e) for e in events[:page_size])
         rows.extend([
-            [InlineKeyboardButton(f"{offset + i + 1}. {event['title'][:60]} · №{event['id']}", callback_data=f"game:{event['id']}")]
+            [InlineKeyboardButton(f"{offset + i + 1}. {event['title'][:60]} · №{event['id']}", callback_data=f"game:{event['id']}:{offset}")]
             for i, event in enumerate(events[:page_size])
         ])
     navigation = []
     if offset:
-        navigation.append(InlineKeyboardButton("← Назад", callback_data=f"games:{max(0, offset - page_size)}"))
+        navigation.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"games:{max(0, offset - page_size)}"))
     if len(events) > page_size:
         navigation.append(InlineKeyboardButton("Далее →", callback_data=f"games:{offset + page_size}"))
     if navigation:
         rows.append(navigation)
-    rows.append([InlineKeyboardButton("Главное меню", callback_data="private_menu")])
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="private_menu")])
+    await private_message(message, text, edit=edit, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,13 +136,13 @@ async def my_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_my_games(update.message, context, update.effective_user.id)
 
 
-async def show_help(message, private):
+async def show_help(message, private, edit=False):
     text = (
         "ℹ️ Помощь\n\n"
         "В группе: /new или /new название — создать игру с бюджетом в RON; "
         "/cancel — отменить незавершённое создание. Отвечай на вопросы ответом на сообщение бота.\n"
         "«Присоединиться» регистрирует в конкретной игре без возможности выхода. "
-        "Сначала можно зарегистрироваться, а затем нажать «📩 Активировать личные сообщения» "
+        "Сначала можно зарегистрироваться, а затем нажать «📩 Открыть бота» "
         "и Start («Запустить») в Telegram. Вручную вводить /start не нужно. "
         "Повторная активация для других игр не требуется. Организатор участвует только после отдельной регистрации.\n"
         "Организатор подтверждает жеребьёвку минимум для 2 участников. "
@@ -140,12 +152,57 @@ async def show_help(message, private):
         "В список входят только игры, где ты зарегистрирован участником.\n"
         "Доставка Telegram не гарантируется; после сбоя возможно повторное сообщение с тем же назначением."
     )
-    await message.reply_text(text, reply_markup=private_menu_keyboard() if private else None)
+    await private_message(message, text, edit=edit, reply_markup=private_menu_keyboard() if private else None)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE or is_group(update):
         await show_help(update.message, update.effective_chat.type == ChatType.PRIVATE)
+
+
+def private_navigation(back=None):
+    rows = []
+    if back:
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back)])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="private_menu")])
+    return rows
+
+
+async def show_recipient(message, context, event, user_id, back, edit=True):
+    recipient = db(context).saved_recipient(event["id"], user_id)
+    text = assignment_text(event, recipient) if recipient else (
+        private_event_text(event) + "\n\nСохранённое назначение не найдено. "
+        "Обратись к организатору. Новая жеребьёвка не выполнялась; прежнее личное сообщение может содержать результат."
+    )
+    await private_message(message, text, edit=edit, parse_mode=ParseMode.HTML,
+                          reply_markup=InlineKeyboardMarkup(private_navigation(back)), disable_web_page_preview=True)
+
+
+async def show_gifts(message, context, user_id, offset=0):
+    events = db(context).completed_assignment_games(user_id, offset, 6)
+    if offset == 0 and len(events) == 1:
+        await show_recipient(message, context, events[0], user_id, "private_menu")
+        return
+    rows = []
+    if not events:
+        if offset:
+            text = "На этой странице завершённых игр нет."
+        elif db(context).participant_games(user_id, limit=1):
+            text = WAITING
+        else:
+            text = "Ты пока не участвуешь в играх. Нажми «🎁 Присоединиться» в объявлении игры в группе."
+    else:
+        text = "🎯 <b>Кому я дарю?</b>\nВыбери игру:\n\n" + "\n\n".join(private_event_text(e) for e in events[:5])
+        rows = [[InlineKeyboardButton(f"{e['title'][:60]} · №{e['id']}", callback_data=f"gift:{e['id']}:{offset}")] for e in events[:5]]
+    pages = []
+    if offset:
+        pages.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"gifts:{max(0, offset - 5)}"))
+    if len(events) > 5:
+        pages.append(InlineKeyboardButton("Далее →", callback_data=f"gifts:{offset + 5}"))
+    if pages:
+        rows.append(pages)
+    rows.extend(private_navigation())
+    await private_message(message, text, edit=True, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def private_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,51 +212,53 @@ async def private_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if query.data == "private_menu":
         await query.answer()
-        await show_private_menu(query.message)
+        await show_private_menu(query.message, edit=True)
         return
     if query.data == "private_help":
         await query.answer()
-        await show_help(query.message, True)
+        await show_help(query.message, True, edit=True)
         return
-    action, _, raw_id = query.data.partition(":")
-    if action not in {"games", "game", "recipient"} or not raw_id.isascii() or not raw_id.isdecimal() or len(raw_id) > 18:
+    parts = query.data.split(":")
+    action, numbers = parts[0], parts[1:]
+    valid_shape = ((action in {"games", "gifts", "recipient"} and len(numbers) == 1)
+                   or (action == "game" and len(numbers) in {1, 2})
+                   or (action in {"gift", "view"} and len(numbers) == 2))
+    if not valid_shape or any(not n.isascii() or not n.isdecimal() or len(n) > 18 for n in numbers):
         await query.answer("Кнопка недоступна. Открой /mygames заново.", show_alert=True)
         return
-    number = int(raw_id)
+    number = int(numbers[0])
+    offset = int(numbers[1]) if len(numbers) > 1 else 0
     user_id = query.from_user.id
-    if action == "games":
+    if action in {"games", "gifts"}:
         await query.answer()
-        await show_my_games(query.message, context, user_id, number)
+        if action == "games":
+            await show_my_games(query.message, context, user_id, number, edit=True)
+        else:
+            await show_gifts(query.message, context, user_id, number)
         return
-    # Never trust membership, status, or a giver ID embedded in an old button.
     event = db(context).participant_event(number, user_id)
     if not event:
         await query.answer("Игра недоступна или ты не зарегистрирован участником.", show_alert=True)
         return
-    rows = [[InlineKeyboardButton("🎁 Мои игры", callback_data="games:0")]]
-    if action == "recipient":
+    if action in {"recipient", "view", "gift"}:
         if event["status"] != COMPLETED:
-            await query.answer("Назначение доступно только после завершённой жеребьёвки.", show_alert=True)
+            await query.answer(CANCELLED_GAME if event["status"] == CANCELLED else WAITING, show_alert=True)
             return
-        recipient = db(context).saved_recipient(number, user_id)
         await query.answer()
-        if recipient:
-            text = (private_event_text(event) + "\n\n🎁 Ты даришь подарок: "
-                    f"<b>{escape(recipient['receiver_name'])}</b> "
-                    f"<a href='tg://user?id={recipient['receiver_user_id']}'>профиль</a>\n\n🤫 Не раскрывай тайну!")
-        else:
-            text = (private_event_text(event) + "\n\nСохранённое назначение не найдено. "
-                    "Обратись к организатору. Новая жеребьёвка не выполнялась; прежнее личное сообщение может содержать результат.")
+        back = f"gifts:{offset}" if action == "gift" else f"game:{number}:{offset}"
+        await show_recipient(query.message, context, event, user_id, back)
+        return
+    await query.answer()
+    text = private_event_text(event)
+    rows = private_navigation(f"games:{offset}")
+    if event["status"] == COMPLETED:
+        rows.insert(0, [InlineKeyboardButton("🎯 Кому я дарю?", callback_data=f"view:{number}:{offset}")])
+    elif event["status"] == CANCELLED:
+        text += "\n\n" + CANCELLED_GAME
     else:
-        await query.answer()
-        text = private_event_text(event)
-        if event["status"] == COMPLETED:
-            rows.insert(0, [InlineKeyboardButton("🎁 Кому я дарю?", callback_data=f"recipient:{number}")])
-        elif event["status"] == CANCELLED:
-            text += "\n\nИгра отменена. Назначений нет."
-        else:
-            text += "\n\nЖеребьёвка ещё не завершена. Получатель пока недоступен."
-    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows), disable_web_page_preview=True)
+        text += "\n\n" + WAITING
+    await private_message(query.message, text, edit=True, parse_mode=ParseMode.HTML,
+                          reply_markup=InlineKeyboardMarkup(rows), disable_web_page_preview=True)
 
 
 async def new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,18 +329,23 @@ def event_keyboard(event):
     return InlineKeyboardMarkup(rows)
 
 
-def render_event_text(event, participants, username):
-    status = {OPEN: "🟢 Регистрация открыта", CANCELLED: "⛔ Игра отменена", COMPLETED: "🎲 Жеребьёвка завершена"}[event["status"]]
-    text = (f"🎅 <b>{escape(event['title'])}</b>\n🎁 Бюджет: {format_budget(event['budget'])}\n"
-            f"👥 Участников: {len(participants)}\n{status}\n\n"
-            f"Для личных результатов: <a href='{escape(activation_url(username, event['id']))}'>📩 Активировать личные сообщения</a> "
+def render_event_text(event, participants, username, announcement=True):
+    active = [bool(p["private_active"]) if "private_active" in p.keys() else False for p in participants]
+    status = {OPEN: "🟢 Регистрация открыта", CANCELLED: CANCELLED_GAME, COMPLETED: "Статус: жеребьёвка проведена"}[event["status"]]
+    text = ((GROUP_INTRO + "\n\n" if announcement else "") + f"🎅 <b>{escape(event['title'])}</b>\n🎁 Бюджет: {format_budget(event['budget'])}\n"
+            f"👥 Участников: {len(participants)}\n📩 Связь с ботом: {sum(active)}/{len(participants)}\n{status}\n\n"
+            f"Для личных результатов: <a href='{escape(activation_url(username, event['id']))}'>📩 Открыть бота</a> "
             "→ Start («Запустить») в Telegram. Если уже активировано, повторять не нужно.\n"
-            "Регистрация необратима.\n\n<b>Участники:</b>\n")
+            "Регистрация необратима.\n\n")
+    if event["status"] == COMPLETED:
+        text += DRAW_COMPLETED + "\n\n"
+    text += "✅ — личный чат активирован\n⏳ — ожидает активации\n\n<b>Участники:</b>\n"
     if not participants:
         return text + "— пока никого"
     # Stay below Telegram's limit even with escaped names.
     for index, participant in enumerate(participants):
-        line = f"{index + 1}. {escape(participant['display_name'][:160])}\n"
+        marker = "✅" if active[index] else "⏳"
+        line = f"{index + 1}. {marker} {escape(participant['display_name'][:160])}\n"
         if len(text) + len(line) > 3500:
             text += f"… ещё {len(participants) - index} участников"
             break
@@ -293,13 +357,17 @@ async def refresh_event(context, event):
     try:
         await context.bot.edit_message_text(
             chat_id=event["chat_id"], message_id=event["message_id"],
-            text=render_event_text(event, db(context).participants(event["id"]), context.bot.username),
+            text=render_event_text(event, db(context).group_participants(event["id"]), context.bot.username),
             reply_markup=event_keyboard(event), parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            raise
+    except BadRequest as error:
+        return "message is not modified" in str(error).lower()
+    except TelegramError:
+        # Deleted cards, lost permissions and temporary failures must never undo saved state.
+        # No replacement group post: a subsequent START/action can retry this same card.
+        return False
+    return True
 
 
 async def creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,22 +429,20 @@ async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not event:
         return
     if event["status"] != OPEN:
-        await query.answer("Регистрация закрыта.", show_alert=True)
+        await query.answer(CLOSED, show_alert=True)
         await refresh_event(context, event)
         return
     user = query.from_user
     name = f"{user.full_name} (@{user.username})" if user.username else user.full_name
     added = db(context).join_event(event["id"], user.id, name)
-    await query.answer("🎉 Вы зарегистрированы в игре" if added else "✅ Вы уже участвуете в этой игре")
+    await query.answer(REGISTRATION_SUCCESS if added else REGISTRATION_REPEAT)
     await refresh_event(context, db(context).get_event(event["id"]))
     if added and not db(context).private_active(user.id):
         await query.message.reply_text(
-            f"<a href='tg://user?id={user.id}'>{escape(user.full_name)}</a>, регистрация сохранена!\n"
-            "Для получения результата открой личный чат кнопкой ниже и нажми Start («Запустить»). "
-            "Вручную вводить /start не нужно. Если чат уже активирован, повторять не требуется.",
+            REGISTRATION_NOTICE + f"\n\n<a href='tg://user?id={user.id}'>{escape(user.full_name)}</a>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📩 Активировать личные сообщения", url=activation_url(context.bot.username, event["id"]))],
+                [InlineKeyboardButton("📩 Открыть бота", url=activation_url(context.bot.username, event["id"]))],
             ]),
         )
 
@@ -396,11 +462,10 @@ async def management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     action = query.data.split(":")[0]
     if event["status"] == COMPLETED and action == "manage":
-        await query.answer()
         counts = db(context).notification_counts(event["id"])
-        text = (f"Жеребьёвка «{event['title']}» завершена.\n"
-                f"Отправлено: {counts['sent']}; ошибок: {counts['failed']}; ожидают: {counts['pending']}.\n"
-                "Назначения не меняются при повторной отправке.")
+        await query.answer(notification_summary(counts), show_alert=True)
+        text = (f"⚙️ Управление игрой «{event['title']}».\n"
+                "Статистика показана только организатору. Назначения не меняются при повторной отправке.")
         if sum(counts.values()) == 0:
             text += "\nЭто игра старой версии без сохранённых пар: восстановление и повтор недоступны."
         buttons = [[InlineKeyboardButton("Повторить неудачные уведомления", callback_data=f"retry:{event['id']}")]] if counts["pending"] + counts["failed"] else []
@@ -439,13 +504,13 @@ def event_lock(context, event_id):
 
 
 async def show_draw_confirmation(query, context, event):
-    participants = db(context).participants(event["id"])
+    participants = db(context).group_participants(event["id"])
     token = uuid4().hex
     context.bot_data.setdefault("draw_confirmations", {})[event["id"]] = {
         "token": token,
         "ids": [p["telegram_user_id"] for p in participants],
     }
-    text = render_event_text(event, participants, context.bot.username)
+    text = render_event_text(event, participants, context.bot.username, announcement=False)
     text += "\n\nПодтвердить жеребьёвку для этого состава? После сохранения изменить пары нельзя."
     eid = event["id"]
     await query.message.reply_text(
@@ -463,13 +528,10 @@ async def send_saved_notifications(context, event):
         try:
             await context.bot.send_message(
                 assignment["giver_user_id"],
-                f"🎅 <b>{escape(event['title'])}</b>\n\nЖеребьёвка состоялась!\n\n"
-                f"🎁 Ты даришь подарок: <b>{escape(assignment['receiver_name'])}</b> "
-                f"<a href='tg://user?id={assignment['receiver_user_id']}'>профиль</a>\n\n"
-                f"💰 Бюджет: {format_budget(event['budget'])}\n\n🤫 Не раскрывай тайну!",
+                assignment_text(event, assignment),
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁 Кому я дарю?", callback_data=f"recipient:{event['id']}")],
+                    [InlineKeyboardButton("🎯 Кому я дарю?", callback_data=f"recipient:{event['id']}")],
                 ]),
             )
         except TelegramError:
@@ -482,16 +544,22 @@ async def send_saved_notifications(context, event):
 
 async def report_notifications(query, context, event):
     counts = db(context).notification_counts(event["id"])
-    remaining = counts["pending"] + counts["failed"]
-    text = (f"Жеребьёвка «{event['title']}» сохранена. "
-            f"Отправлено: {counts['sent']}; ошибок: {counts['failed']}; ожидают: {counts['pending']}.")
-    if remaining:
-        text += " Не все уведомления отправлены. Организатор может повторить их через «⚙️ Управление». Пары не изменятся."
-    await query.message.reply_text(text)
+    try:
+        await query.answer(notification_summary(counts), show_alert=True)
+    except TelegramError:
+        # A long delivery may outlive the callback. A fresh Manage callback shows counts.
+        pass
     try:
         await refresh_event(context, event)
     except TelegramError:
         await query.message.reply_text("Не удалось обновить карточку группы. Назначения сохранены; повтори «⚙️ Управление».")
+
+
+def notification_summary(counts):
+    text = f"Отправлено: {counts['sent']}; ошибок: {counts['failed']}; ожидают: {counts['pending']}."
+    if counts["pending"] + counts["failed"]:
+        text += " Повтор — через «Управление». Пары сохранены."
+    return text
 
 
 async def draw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,7 +575,7 @@ async def draw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     participants = db(context).participants(event["id"])
     if len(participants) < 2:
-        await query.answer("Нужно минимум 2 участника.", show_alert=True)
+        await query.answer(TOO_FEW, show_alert=True)
         return
     action = query.data.split(":")[0]
     confirmations = context.bot_data.setdefault("draw_confirmations", {})
@@ -553,6 +621,10 @@ async def draw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         completed = db(context).get_event(event["id"])
+        try:
+            await refresh_event(context, completed)
+        except TelegramError:
+            pass  # Notification delivery must not depend on the group message being editable.
         await send_saved_notifications(context, completed)
         await report_notifications(query, context, completed)
 
@@ -620,7 +692,7 @@ def main():
     app.add_handler(CallbackQueryHandler(draw_callback, pattern=r"^draw:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(draw_callback, pattern=r"^draw_(yes|no):[0-9]+:[a-f0-9]{32}$"))
     app.add_handler(CallbackQueryHandler(retry_callback, pattern=r"^retry:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(private_callback, pattern=r"^(?:private_menu|private_help|(?:games|game|recipient):.*)$"))
+    app.add_handler(CallbackQueryHandler(private_callback, pattern=r"^(?:private_menu|private_help|(?:games|game|recipient|gifts|gift|view):.*)$"))
     app.add_handler(CallbackQueryHandler(legacy_callback, pattern=r"^(join|draw|noop)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, creation_input))
     app.add_error_handler(on_error)

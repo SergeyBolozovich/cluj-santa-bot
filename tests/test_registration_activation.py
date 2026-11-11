@@ -36,7 +36,7 @@ class RegistrationActivationTests(unittest.IsolatedAsyncioTestCase):
     def update(self, user_id=20, data=None, private=False, chat_id=-100):
         user = SimpleNamespace(id=user_id, full_name=f"<Участник {user_id}>", username=f"user{user_id}")
         chat = SimpleNamespace(id=user_id if private else chat_id, type="private" if private else "supergroup")
-        message = SimpleNamespace(reply_text=self.reply, chat_id=chat.id)
+        message = SimpleNamespace(reply_text=self.reply, edit_text=self.reply, chat_id=chat.id)
         query = SimpleNamespace(
             data=data, from_user=user, message=message, answer=AsyncMock(),
             edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock(),
@@ -61,7 +61,7 @@ class RegistrationActivationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tg://user?id=20", text)
         self.assertIn("&lt;Участник 20&gt;", text)
         button = self.reply.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "📩 Активировать личные сообщения")
+        self.assertEqual(button.text, "📩 Открыть бота")
         self.assertEqual(button.url, f"https://t.me/TestSantaBot?start=activate_{event['id']}")
         self.context.bot.send_message.assert_not_awaited()  # Never try an unsolicited DM.
 
@@ -70,7 +70,7 @@ class RegistrationActivationTests(unittest.IsolatedAsyncioTestCase):
         await self.join(event)
         self.reply.reset_mock()
         update = await self.join(event)
-        update.callback_query.answer.assert_awaited_once_with("✅ Вы уже участвуете в этой игре")
+        update.callback_query.answer.assert_awaited_once_with("✅ Ты уже участвуешь в этой игре!")
         self.assertEqual(len(self.store.participants(event["id"])), 1)
         self.reply.assert_not_awaited()
 
@@ -161,7 +161,8 @@ class RegistrationActivationTests(unittest.IsolatedAsyncioTestCase):
             await self.activate(event, user_id)
         await bot.draw_callback(self.update(user_id=10, data=f"draw:{event['id']}"), self.context)
         token = self.context.bot_data["draw_confirmations"][event["id"]]["token"]
-        await bot.draw_callback(self.update(user_id=10, data=f"draw_yes:{event['id']}:{token}"), self.context)
+        confirm = self.update(user_id=10, data=f"draw_yes:{event['id']}:{token}")
+        await bot.draw_callback(confirm, self.context)
         markup = self.context.bot.edit_message_text.call_args.kwargs["reply_markup"]
         data = [b.callback_data for row in markup.inline_keyboard for b in row]
         self.assertNotIn(f"join:{event['id']}", data)
@@ -184,10 +185,11 @@ class RegistrationActivationTests(unittest.IsolatedAsyncioTestCase):
         token = self.context.bot_data["draw_confirmations"][event["id"]]["token"]
         self.assertEqual(self.store.assignments(event["id"]), [])
         self.context.bot.send_message.assert_not_awaited()
-        await bot.draw_callback(self.update(user_id=10, data=f"draw_yes:{event['id']}:{token}"), self.context)
+        confirm = self.update(user_id=10, data=f"draw_yes:{event['id']}:{token}")
+        await bot.draw_callback(confirm, self.context)
         self.assertEqual(self.store.notification_counts(event["id"]), {"sent": 1, "failed": 2, "pending": 0})
         pairs = [dict(row) for row in self.store.assignments(event["id"])]
-        report = self.reply.call_args.args[0]
+        report = confirm.callback_query.answer.call_args.args[0]
         self.assertIn("Отправлено: 1; ошибок: 2", report)
         self.assertNotIn("tg://user", report)
         self.store.close()
@@ -195,7 +197,7 @@ class RegistrationActivationTests(unittest.IsolatedAsyncioTestCase):
         self.context.bot_data = {"storage": self.store}
         await self.activate(event, 20)
         await bot.my_games(self.update(user_id=20, private=True), self.context)
-        self.assertIn(f"game:{event['id']}", [b.callback_data for row in self.reply.call_args.kwargs["reply_markup"].inline_keyboard for b in row])
+        self.assertIn(f"game:{event['id']}:0", [b.callback_data for row in self.reply.call_args.kwargs["reply_markup"].inline_keyboard for b in row])
         await bot.private_callback(self.update(user_id=20, data=f"recipient:{event['id']}", private=True), self.context)
         recipient = self.store.saved_recipient(event["id"], 20)
         self.assertIn(f"tg://user?id={recipient['receiver_user_id']}", self.reply.call_args.args[0])

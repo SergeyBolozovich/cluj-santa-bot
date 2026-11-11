@@ -32,7 +32,7 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
     def update(self, user_id=20, data=None, private=True):
         user = SimpleNamespace(id=user_id)
         chat = SimpleNamespace(id=user_id if private else -100, type="private" if private else "supergroup")
-        message = SimpleNamespace(reply_text=self.reply, chat_id=chat.id)
+        message = SimpleNamespace(reply_text=self.reply, edit_text=self.reply, chat_id=chat.id)
         query = SimpleNamespace(data=data, from_user=user, message=message, answer=AsyncMock()) if data else None
         return SimpleNamespace(effective_chat=chat, effective_user=user, message=message, callback_query=query)
 
@@ -53,8 +53,8 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.store.private_active(20))
         await bot.start(self.update(), self.context)
         self.assertTrue(self.store.private_active(20))
-        self.assertIn("Тайный Санта", self.reply.call_args.args[0])
-        self.assertEqual([b.text for b in self.buttons()], ["🎁 Мои игры", "ℹ️ Помощь"])
+        self.assertIn("штаб Санты", self.reply.call_args.args[0])
+        self.assertEqual([b.text for b in self.buttons()], ["🎁 Мои игры", "🎯 Кому я дарю?", "❓ Как это работает"])
 
     async def test_start_in_group_does_not_show_private_menu(self):
         await bot.start(self.update(private=False), self.context)
@@ -72,9 +72,9 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         owned_participation = self.event("both", owner=20, chat=-200)
         await bot.my_games(self.update(), self.context)
         data = [b.callback_data for b in self.buttons()]
-        self.assertIn(f"game:{first['id']}", data)
-        self.assertIn(f"game:{owned_participation['id']}", data)
-        self.assertNotIn(f"game:{owned_only['id']}", data)
+        self.assertIn(f"game:{first['id']}:0", data)
+        self.assertIn(f"game:{owned_participation['id']}:0", data)
+        self.assertNotIn(f"game:{owned_only['id']}:0", data)
         text = self.reply.call_args.args[0]
         self.assertIn("100,50 RON", text)
         self.assertIn("Регистрация открыта", text)
@@ -101,12 +101,12 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         await bot.private_callback(self.update(data="private_help"), self.context)
         self.assertIn("/mygames", self.reply.call_args.args[0])
         await bot.private_callback(self.update(data="private_menu"), self.context)
-        self.assertEqual([b.callback_data for b in self.buttons()], ["games:0", "private_help"])
+        self.assertEqual([b.callback_data for b in self.buttons()], ["games:0", "gifts:0", "private_help"])
 
     async def test_open_event_has_no_recipient_action(self):
         event = self.event()
         await bot.private_callback(self.update(data=f"game:{event['id']}"), self.context)
-        self.assertIn("ещё не завершена", self.reply.call_args.args[0])
+        self.assertIn("Санта ещё не провёл жеребьёвку", self.reply.call_args.args[0])
         self.assertFalse(any(b.callback_data.startswith("recipient:") for b in self.buttons()))
         self.reply.reset_mock()
         await bot.private_callback(self.update(data=f"recipient:{event['id']}"), self.context)
@@ -116,9 +116,9 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         event = self.event()
         self.store.cancel_event(event["id"], 10)
         await bot.my_games(self.update(), self.context)
-        self.assertIn("Игра отменена", self.reply.call_args.args[0])
+        self.assertIn("игра отменена", self.reply.call_args.args[0])
         await bot.private_callback(self.update(data=f"game:{event['id']}"), self.context)
-        self.assertIn("Назначений нет", self.reply.call_args.args[0])
+        self.assertIn("Эта игра отменена организатором", self.reply.call_args.args[0])
         self.assertFalse(any(b.callback_data.startswith("recipient:") for b in self.buttons()))
         self.reply.reset_mock()
         await bot.private_callback(self.update(data=f"recipient:{event['id']}"), self.context)
@@ -129,7 +129,7 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         await bot.private_callback(self.update(data=f"game:{event['id']}"), self.context)
         self.assertIn("Жеребьёвка завершена", self.reply.call_args.args[0])
         self.assertNotIn("tg://user", self.reply.call_args.args[0])
-        self.assertIn(f"recipient:{event['id']}", [b.callback_data for b in self.buttons()])
+        self.assertIn(f"view:{event['id']}:0", [b.callback_data for b in self.buttons()])
 
     async def test_recipient_is_own_saved_pair_and_read_does_not_change_draw(self):
         event = self.event(participants=(20, 21, 22), completed=True)
@@ -194,7 +194,7 @@ class PrivateMenuTests(unittest.IsolatedAsyncioTestCase):
         self.store = Storage(self.path)
         self.context.bot_data = {"storage": self.store}
         await bot.my_games(self.update(), self.context)
-        self.assertIn(f"game:{event['id']}", [b.callback_data for b in self.buttons()])
+        self.assertIn(f"game:{event['id']}:0", [b.callback_data for b in self.buttons()])
         await bot.private_callback(self.update(data=f"recipient:{event['id']}"), self.context)
         self.assertIn("tg://user?id=21", self.reply.call_args.args[0])
         self.assertEqual([dict(r) for r in self.store.assignments(event["id"])], before)

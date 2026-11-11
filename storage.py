@@ -108,6 +108,15 @@ class Storage:
             (event_id, user_id),
         ).fetchone()
 
+    def completed_assignment_games(self, user_id, offset=0, limit=6):
+        return self.connection.execute(
+            """SELECT e.*, (SELECT count(*) FROM participants p WHERE p.event_id=e.id) AS participant_count
+               FROM events e JOIN assignments a ON a.event_id=e.id
+               JOIN participants giver ON giver.event_id=e.id AND giver.telegram_user_id=a.giver_user_id
+               WHERE a.giver_user_id=? AND e.status=? ORDER BY e.id DESC LIMIT ? OFFSET ?""",
+            (user_id, COMPLETED, limit, offset),
+        ).fetchall()
+
     def saved_recipient(self, event_id, user_id):
         """Read only this participant's assignment, and only for a completed draw."""
         return self.connection.execute(
@@ -129,6 +138,23 @@ class Storage:
         return self.connection.execute(
             "SELECT * FROM participants WHERE event_id = ? ORDER BY joined_at, telegram_user_id",
             (event_id,),
+        ).fetchall()
+
+    def group_participants(self, event_id):
+        """Activation is derived from SS-4 users; no second state is stored."""
+        return self.connection.execute(
+            """SELECT p.*, u.telegram_user_id IS NOT NULL AS private_active
+               FROM participants p LEFT JOIN users u ON u.telegram_user_id=p.telegram_user_id
+               WHERE p.event_id=? ORDER BY p.joined_at, p.telegram_user_id""",
+            (event_id,),
+        ).fetchall()
+
+    def participant_announcements(self, user_id):
+        """All editable card references, including completed/cancelled games, without menu pagination."""
+        return self.connection.execute(
+            """SELECT e.* FROM events e JOIN participants p ON p.event_id=e.id
+               WHERE p.telegram_user_id=? AND e.message_id IS NOT NULL ORDER BY e.id""",
+            (user_id,),
         ).fetchall()
 
     def join_event(self, event_id, user_id, display_name):

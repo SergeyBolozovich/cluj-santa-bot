@@ -36,7 +36,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def message(self, message_id=1, text="", reply_to=None):
         return SimpleNamespace(
             message_id=message_id, chat_id=-100, text=text,
-            reply_to_message=reply_to, reply_text=self.reply,
+            reply_to_message=reply_to, reply_text=self.reply, edit_text=self.reply,
         )
 
     def update(self, user_id=10, chat_id=-100, chat_type="supergroup", text="", reply_to=None, data=None):
@@ -283,14 +283,14 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_event(event["id"])["status"], COMPLETED)
         self.assertEqual(len(self.store.assignments(event["id"])), 3)
         self.assertEqual(self.store.notification_counts(event["id"])["failed"], 3)
-        self.assertIn("ошибок: 3", self.reply.call_args.args[0])
+        self.assertIn("ошибок: 3", confirm.callback_query.answer.call_args.args[0])
 
     async def test_assignments_are_committed_before_first_result_send(self):
         event = self.ready_event()
         observed = []
 
         async def observe(chat_id, text, **kwargs):
-            if "Ты даришь подарок:" in text:
+            if "Ты даришь подарок " in text:
                 self.assertEqual(self.store.get_event(event["id"])["status"], COMPLETED)
                 self.assertEqual(len(self.store.assignments(event["id"])), 3)
                 self.assertFalse(self.store.connection.in_transaction)
@@ -302,7 +302,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await bot.draw_callback(confirm, self.context)
         self.assertCountEqual(observed, [20, 21, 22])
         for call in self.reply.call_args_list:
-            self.assertNotIn("Ты даришь подарок:", call.args[0])
+            self.assertNotIn("Ты даришь подарок ", call.args[0])
 
     async def test_database_failure_never_sends_assignment(self):
         event = self.ready_event()
@@ -317,7 +317,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         event = self.ready_event()
 
         async def fail_one(chat_id, text, **kwargs):
-            if "Ты даришь подарок:" in text and chat_id == 20:
+            if "Ты даришь подарок " in text and chat_id == 20:
                 raise NetworkError("uncertain outcome")
 
         self.context.bot.send_message.side_effect = fail_one
@@ -325,7 +325,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await bot.draw_callback(confirm, self.context)
         pairs = [(r["giver_user_id"], r["receiver_user_id"]) for r in self.store.assignments(event["id"])]
         self.assertEqual(self.store.notification_counts(event["id"]), {"sent": 2, "pending": 0, "failed": 1})
-        self.assertIn("ошибок: 1", self.reply.call_args.args[0])
+        self.assertIn("ошибок: 1", confirm.callback_query.answer.call_args.args[0])
         self.context.bot.send_message.reset_mock()
         self.context.bot.send_message.side_effect = None
         with patch.object(self.store, "complete_draw", side_effect=AssertionError("No draw on retry")):
@@ -408,9 +408,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_management_shows_counts_and_retry_only(self):
         event = self.ready_event()
         self.store.complete_draw(event["id"], 10, [20, 21, 22])
-        await bot.management_callback(self.update(data=f"manage:{event['id']}"), self.context)
+        update = self.update(data=f"manage:{event['id']}")
+        await bot.management_callback(update, self.context)
         text = self.reply.call_args.args[0]
-        self.assertIn("ожидают: 3", text)
+        self.assertIn("ожидают: 3", update.callback_query.answer.call_args.args[0])
+        self.assertNotIn("ожидают:", text)
         self.assertNotIn("tg://user", text)
         markup = self.reply.call_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, f"retry:{event['id']}")
